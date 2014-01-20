@@ -1,0 +1,88 @@
+#!/usr/bin/env ruby
+
+# newrelic_plugin requires
+require 'rubygems'
+require 'bundler/setup'
+require 'newrelic_plugin'
+
+# resque requires
+require 'redis'
+require 'resque'
+
+module ResqueDepthAgent
+
+  # Create groups for desplaying overall statistics
+  def ResqueDepthAgent.groups()
+    return {
+      'Queue Processing' => {
+        'metrics' => %w(pending processed failed)
+      },
+      'Queue Stats' => {
+        'metrics' => %w(queues workers working)
+      }
+    }
+  end
+
+  # Get redis info
+  def ResqueDepthAgent.resque_info(redis = nil, namespace = nil)
+    Resque.redis = redis
+    Resque.redis.namespace = namespace unless namespace.nil?
+
+    queues = Hash.new
+    Resque.queues.each do | queue_name |
+      queues[queue_name] = Resque.size(queue_name)
+    end  
+    return Resque.info,queues
+  end
+
+  #
+  # Agent, Metric and PollCycle classes
+  #
+  #  Each agent module must have an Agent, Metric, and PollCycle class that inherits from their
+  #  Component counterparts as you can see below.
+  #
+  class Agent < NewRelic::Plugin::Agent::Base
+
+    agent_guid 'com.ridecharge.newrelic_resque_depth'
+    agent_version '0.0.1'
+    agent_config_options :redis, :namespace
+    agent_human_labels('ResqueDepth') {"ResqueDepth #{@namespace}" }
+
+    def setup_metrics
+      @processed_requests = NewRelic::Processor::EpochCounter.new
+      @failed_requests = NewRelic::Processor::EpochCounter.new
+    end
+
+    def poll_cycle
+      stats, queues = ResqueDepthAgent.resque_info(@redis, @namespace)
+    
+      # Report on Resque Info
+      ResqueDepthAgent.groups.each do |gname, group|
+        group['metrics'].each do | metric |
+          stat = stats[metric.to_sym]
+          if stat.nil?
+            next
+          end
+          if metric == 'processed'
+            report_metric "#{gname}/#{metric}", metric, @processed_requests.process(stat.to_i)
+          elsif metric == 'failed'
+            report_metric "#{gname}/#{metric}", metric, @failed_requests.process(stat.to_i)
+          else
+            report_metric "#{gname}/#{metric}", metric, stat.to_i
+          end
+        end
+      end
+
+      # Report on Queue Depth
+      queues.each do | queue_name, depth |
+        report_metric "Queue Depth/#{queue_name}", queue_name, depth.to_i
+      end
+
+    end
+  end
+
+  NewRelic::Plugin::Setup.install_agent :resque_depth,ResqueDepthAgent
+
+  NewRelic::Plugin::Run.setup_and_run
+
+end
